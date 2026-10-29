@@ -53,17 +53,19 @@ python3 shot.py https://example.com https://example.com/cart -d sample --check
 It reports:
 
 - the page scrolling sideways, and the elements that stick out on the right (a closed drawer, wholly off-screen, is ignored);
-- tap targets under 24 px on touch devices (WCAG 2.5.8, with its spacing exception and links inside running text exempt);
+- tap targets under 24 px on touch devices (WCAG 2.5.8, with its spacing exception and links inside running text exempt); identical ones (carousel dots) are one line with a count;
 - text cut with an ellipsis or a line clamp;
 - broken images;
-- fixed or sticky layers covering over 25 / 50 / 75 % of the screen (cookie banners, chat bubbles);
+- fixed layers covering over 25 / 50 / 75 % of the screen (cookie banners, chat bubbles; sticky galleries and sidebars are layout, not layers);
 - JavaScript errors, console errors and requests answered 4xx/5xx (`NOISE` lists platform requests that always fail, such as Shopify's `sf_private_access_tokens`).
 
-A whole site: `--sitemap N` reads `/sitemap.xml` and adds N pages of each kind (products, collections, pages, articles…), picked evenly through each list rather than the first N. Chunks of one kind (`sitemap_products_1`, `_2`…) count as one list, and the per-language copies (`/fr/sitemap_products_1.xml`) are skipped: same templates. A URL ending in `.xml` is read as the sitemap itself.
+A whole site: `--sitemap N` reads `/sitemap.xml` and adds N pages of each kind (products, collections, pages, articles…), picked evenly through each list rather than the first N. Chunks of one kind (`sitemap_products_1`, `_2`…) count as one list, and the per-language copies (`/fr/sitemap_products_1.xml`) are skipped: same templates. Files listed in a sitemap (`agents.md`, feeds) are not pages and are skipped. A URL ending in `.xml` is read as the sitemap itself.
 
 ```sh
 python3 shot.py https://shop.example --check --sitemap 3 -d "iPhone SE" -d "iPhone 13" -d desktop
 ```
+
+With three pages or more, the problems every page shares (header, footer, cookie banner) are listed once at the top, and each page lists only what is its own.
 
 Devices run in parallel, one browser each (`--jobs`, default 4). A page that fails to load (timeout, network error) is reported as a finding instead of ending the run.
 

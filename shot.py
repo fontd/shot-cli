@@ -69,11 +69,14 @@ def load(page, url, a, scroll):
 CHECK_JS = '''(vw) => {
   // vw is the device's width: a phone zooms out to fit a page that is too wide, so innerWidth grows with it.
   const out = [], all = [...document.querySelectorAll('body *')];
-  const desc = e => {
+  const tag = e => {
     let s = e.tagName.toLowerCase();
     if (e.id) s += '#' + e.id; else if (e.classList.length) s += '.' + [...e.classList].slice(0, 2).join('.');
+    return s;
+  };
+  const desc = e => {
     const t = (e.innerText || e.alt || e.getAttribute('aria-label') || '').trim().replace(/\\s+/g, ' ').slice(0, 40);
-    return t ? `${s} "${t}"` : s;
+    return t ? `${tag(e)} "${t}"` : tag(e);
   };
   const shown = e => {
     const c = getComputedStyle(e), r = e.getBoundingClientRect();
@@ -98,9 +101,13 @@ CHECK_JS = '''(vw) => {
         && q.left < cx + 12 && q.right > cx - 12 && q.top < cy + 12 && q.bottom > cy - 12); };
     const small = targets.filter(([e, r]) => (r.width < 24 || r.height < 24) && crowded(e, r)
       && !(getComputedStyle(e).display === 'inline' && e.closest('p, li, td'))).map(([e]) => e);
-    small.slice(0, 8).forEach(e => { const r = e.getBoundingClientRect();
-      out.push(`tap target ${Math.round(r.width)}×${Math.round(r.height)} px (under 24): ${desc(e)}`); });
-    if (small.length > 8) out.push(`… and ${small.length - 8} more small tap targets`);
+    // same size and class (carousel dots, a row of icons) = one line with a count; no cap, so a footer shared by
+    // every page lists the same lines on every page and the report can fold them together
+    const groups = new Map();
+    small.forEach(e => { const r = e.getBoundingClientRect(), key = `${Math.round(r.width)}×${Math.round(r.height)} px (under 24): ${tag(e)}`;
+      groups.set(key, [...(groups.get(key) || []), e]); });
+    groups.forEach((els, key) => out.push(els.length > 1 ? `tap target ${key} ×${els.length}` :
+      `tap target ${key.replace(/: .*$/, ': ' + desc(els[0]))}`));
   }
   all.filter(e => { const c = getComputedStyle(e);  // under 20 px wide = an icon or dot whose label is hidden on purpose
     return shown(e) && e.getBoundingClientRect().width >= 20 && ((c.textOverflow === 'ellipsis' && e.scrollWidth > e.clientWidth + 1)
@@ -108,7 +115,8 @@ CHECK_JS = '''(vw) => {
     .slice(0, 8).forEach(e => out.push(`text cut with …: ${desc(e)}`));
   [...document.images].filter(i => i.complete && i.naturalWidth === 0 && i.getAttribute('src') && shown(i))
     .slice(0, 8).forEach(i => out.push(`broken image: ${i.currentSrc || i.src}`));
-  const fixed = all.filter(e => /fixed|sticky/.test(getComputedStyle(e).position) && shown(e));
+  // fixed only: a sticky product gallery or sidebar is page layout, not a layer over it
+  const fixed = all.filter(e => getComputedStyle(e).position === 'fixed' && shown(e));
   fixed.filter(e => !fixed.some(f => f !== e && f.contains(e))).forEach(e => {
     const r = e.getBoundingClientRect();
     const w = innerWidth, h = innerHeight;  // what is on screen now, zoomed out or not
@@ -200,6 +208,9 @@ def sitemap_pages(p, url, n):
         groups = {k: v[1] for k, v in groups.items()}
     pages = [] if own else [url]
     for group in groups.values():
+        # files listed next to the pages (agents.md, feeds) are not pages; the site root comes back as «/»
+        group = [g for g in group if not re.search(r'\.(?!html?$)[a-z0-9]{1,5}$', urlsplit(g).path)
+                 and g.rstrip('/') != url.rstrip('/')]
         pages += group[::max(1, len(group) // n)][:n]
     req.dispose()
     return pages
@@ -345,13 +356,25 @@ def where(seen, labels):
 
 
 def print_report(report, urls, labels):
-    """One block per URL; a problem seen on several devices is listed once, with where it happens."""
-    for u in urls:
-        problems = report.get(u, {})
-        print(f'{u}: {"OK" if not problems else f"{len(problems)} problem(s)"}')
+    """One block per URL; a problem seen on several devices is listed once, with where it happens. With three
+    pages or more, what every page shares (header, footer, cookie banner) comes first, once."""
+    def block(problems):
         for problem, seen in sorted(problems.items(), key=lambda kv: -len(kv[1])):
             print(f'  - {problem}\n      on {where(seen, labels)}')
-    return sum(len(v) for v in report.values())
+
+    common = {}
+    if len(urls) > 2:
+        for problem in set.intersection(*(set(report.get(u, {})) for u in urls)):
+            seen = {lbl for u in urls for lbl in report[u][problem]}
+            common[problem] = [lbl for lbl, _ in labels if lbl in seen]
+        if common:
+            print(f'On every page ({len(urls)}): {len(common)} problem(s)')
+            block(common)
+    for u in urls:
+        problems = {k: v for k, v in report.get(u, {}).items() if k not in common}
+        print(f'{u}: {"OK" if not problems else f"{len(problems)} problem(s)"}{" more" if problems and common else ""}')
+        block(problems)
+    return len(common) + sum(len([k for k in v if k not in common]) for v in report.values())
 
 
 if __name__ == '__main__':

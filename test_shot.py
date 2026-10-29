@@ -67,6 +67,12 @@ with tempfile.TemporaryDirectory() as tmp:
     assert r.returncode == 1, r
     assert 'did not load' in r.stdout and f'{good.as_uri()}: OK' in r.stdout, r.stdout
     assert 'scrolls sideways' in r.stdout and 'on iPhone 13 · 390 px' in r.stdout, r.stdout
+    # what all pages share is listed once, first
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        shot.main([bad.as_uri() + f'?{i}' for i in range(3)] + ['--check', '--wait', '0'])
+    text = buf.getvalue()
+    assert text.startswith('On every page (3)') and text.count('broken image') == 1 and f'{bad.as_uri()}?2: OK' in text, text
     # --sitemap: products in two chunks (with image entries) count as one kind, the /es/ copy is skipped (it is not
     # even served: fetching it would fail), 2 pages spread through each kind, plus the URL given
     import functools, http.server, threading
@@ -79,7 +85,7 @@ with tempfile.TemporaryDirectory() as tmp:
     for name, first in (('a_1', 0), ('a_2', 5), ('b_1', 0)):
         (site / f'sitemap_{name}.xml').write_text(f'<urlset {ns}>' + ''.join(
             f'<url><loc>http://x/{name[0]}{i}</loc><image:image><image:loc>http://x/img{i}.jpg</image:loc></image:image></url>'
-            for i in range(first, first + 5)) + '</urlset>')
+            for i in range(first, first + 5)) + ('<url><loc>http://x/agents.md</loc></url>' if name == 'b_1' else '') + '</urlset>')
     server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), functools.partial(http.server.SimpleHTTPRequestHandler, directory=site))
     port = server.server_address[1]
     (site / 'sitemap.xml').write_text((site / 'sitemap.xml').read_text().replace('{port}', str(port)))
