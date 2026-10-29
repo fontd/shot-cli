@@ -14,6 +14,7 @@ plus out.png, a contact sheet of them all at CSS-pixel scale, each labelled with
 -e chromium uses the installed Chrome (no download); -e webkit is Safari's engine (playwright install webkit).
 """
 import argparse
+import json
 import os
 import re
 import sys
@@ -69,6 +70,9 @@ def load(page, url, a, scroll):
 CHECK_JS = '''(vw) => {
   // vw is the device's width: a phone zooms out to fit a page that is too wide, so innerWidth grows with it.
   const out = [], all = [...document.querySelectorAll('body *')];
+  // each finding: [text, box of the element in page coordinates, or null], the box is what --html crops
+  const add = (text, e) => { const r = e && e.getBoundingClientRect();
+    out.push([text, r ? { x: r.left + scrollX, y: r.top + scrollY, width: r.width, height: r.height } : null]); };
   const tag = e => {
     let s = e.tagName.toLowerCase();
     if (e.id) s += '#' + e.id; else if (e.classList.length) s += '.' + [...e.classList].slice(0, 2).join('.');
@@ -84,13 +88,13 @@ CHECK_JS = '''(vw) => {
     return c.display !== 'none' && c.visibility !== 'hidden' && +c.opacity > 0 && r.width > 2 && r.height > 2;
   };
   const sw = document.documentElement.scrollWidth;
-  if (sw > vw + 1) out.push(`scrolls sideways: page is ${sw} px on a ${vw} px screen`);
+  if (sw > vw + 1) add(`scrolls sideways: page is ${sw} px on a ${vw} px screen`);
   // Partly off the right edge (wholly off-screen = a closed drawer, on purpose) and not clipped by a scroller.
   const free = e => { for (let p = e.parentElement; p && p !== document.body; p = p.parentElement)
     if (getComputedStyle(p).overflowX !== 'visible') return false; return true; };
   const wide = all.filter(e => { const r = e.getBoundingClientRect(); return r.left < vw && r.right > vw + 1 && shown(e) && free(e); });
   wide.filter(e => !wide.includes(e.parentElement)).slice(0, 8)
-    .forEach(e => out.push(`sticks out ${Math.round(e.getBoundingClientRect().right - vw)} px on the right: ${desc(e)}`));
+    .forEach(e => add(`sticks out ${Math.round(e.getBoundingClientRect().right - vw)} px on the right: ${desc(e)}`, e));
   if (matchMedia('(pointer: coarse)').matches) {
     // WCAG 2.5.8: under 24 px fails unless a 24 px square centred on it touches no other target (spacing exception);
     // links inside running text are exempt too.
@@ -106,15 +110,15 @@ CHECK_JS = '''(vw) => {
     const groups = new Map();
     small.forEach(e => { const r = e.getBoundingClientRect(), key = `${Math.round(r.width)}×${Math.round(r.height)} px (under 24): ${tag(e)}`;
       groups.set(key, [...(groups.get(key) || []), e]); });
-    groups.forEach((els, key) => out.push(els.length > 1 ? `tap target ${key} ×${els.length}` :
-      `tap target ${key.replace(/: .*$/, ': ' + desc(els[0]))}`));
+    groups.forEach((els, key) => add(els.length > 1 ? `tap target ${key} ×${els.length}` :
+      `tap target ${key.replace(/: .*$/, ': ' + desc(els[0]))}`, els[0]));
   }
   all.filter(e => { const c = getComputedStyle(e);  // under 20 px wide = an icon or dot whose label is hidden on purpose
     return shown(e) && e.getBoundingClientRect().width >= 20 && ((c.textOverflow === 'ellipsis' && e.scrollWidth > e.clientWidth + 1)
       || (c.webkitLineClamp && c.webkitLineClamp !== 'none' && e.scrollHeight > e.clientHeight + 1)); })
-    .slice(0, 8).forEach(e => out.push(`text cut with …: ${desc(e)}`));
+    .slice(0, 8).forEach(e => add(`text cut with …: ${desc(e)}`, e));
   [...document.images].filter(i => i.complete && i.naturalWidth === 0 && i.getAttribute('src') && shown(i))
-    .slice(0, 8).forEach(i => out.push(`broken image: ${i.currentSrc || i.src}`));
+    .slice(0, 8).forEach(i => add(`broken image: ${i.currentSrc || i.src}`, i));
   // fixed only: a sticky product gallery or sidebar is page layout, not a layer over it
   const fixed = all.filter(e => getComputedStyle(e).position === 'fixed' && shown(e));
   fixed.filter(e => !fixed.some(f => f !== e && f.contains(e))).forEach(e => {
@@ -123,7 +127,7 @@ CHECK_JS = '''(vw) => {
     const area = Math.max(0, Math.min(r.right, w) - Math.max(r.left, 0)) * Math.max(0, Math.min(r.bottom, h) - Math.max(r.top, 0));
     // in quarters, so one banner reads as one problem across devices instead of 37 %, 39 %, 45 %…
     const q = Math.floor(4 * area / (w * h));
-    if (q) out.push(`fixed layer covers over ${25 * q} % of the screen: ${desc(e)}`);
+    if (q) add(`fixed layer covers over ${25 * q} % of the screen: ${desc(e)}`, e);
   });
   return out;
 }'''
@@ -142,13 +146,36 @@ def check(ctx, url, a):
             and errors.append(f'console error: {m.text[:160]}'))
     page.on('response', lambda r: r.status >= 400 and not any(n in r.url for n in NOISE)
             and errors.append(f'{r.status} {r.url[:160]}'))
+    found = {}  # text → cropped PNG (base64) or None; a dict, so two identical elements are one finding
     try:
         load(page, url, a, scroll=True)
-        found = page.evaluate(CHECK_JS, page.viewport_size['width'])
+        for text, box in page.evaluate(CHECK_JS, page.viewport_size['width']):
+            found.setdefault(text, crop(page, box) if a.html and box else None)
     except PlaywrightError as e:  # a timeout or a crash is a finding for this page, not the end of the run
-        found = [f'did not load: {str(e).splitlines()[0][:160]}']
+        found[f'did not load: {str(e).splitlines()[0][:160]}'] = None
     page.close()
-    return found + list(dict.fromkeys(errors))
+    return found | dict.fromkeys(errors)
+
+
+def crop(page, box, pad=24):
+    """The element and a margin around it, outlined in red (in a row of links, which one), as base64 PNG."""
+    import base64
+    import io
+    from PIL import Image, ImageDraw
+    x, y = max(0, box['x'] - pad), max(0, box['y'] - pad)
+    clip = {'x': x, 'y': y, 'width': min(box['width'] + 2 * pad, 1200), 'height': min(box['height'] + 2 * pad, 800)}
+    try:
+        png = page.screenshot(clip=clip, full_page=True)
+    except PlaywrightError:  # off the page or zero-sized after a re-layout: the text still says what is wrong
+        return None
+    im = Image.open(io.BytesIO(png)).convert('RGB')
+    k = im.width / clip['width']  # device pixels per CSS pixel
+    left, top = (box['x'] - x) * k, (box['y'] - y) * k
+    ImageDraw.Draw(im).rectangle([left, top, left + box['width'] * k, top + box['height'] * k],
+                                 outline=(230, 30, 30), width=max(2, round(k * 1.5)))
+    out = io.BytesIO()
+    im.save(out, 'PNG')
+    return base64.b64encode(out.getvalue()).decode()
 
 
 def launch(p, a):
@@ -175,7 +202,7 @@ def check_device(a, dev):
     with sync_playwright() as p:
         b = launch(p, a)
         ctx, opts, label = context(p, b, dev, a)
-        found = {u: list(dict.fromkeys(check(ctx, u, a))) for u in a.urls}  # two identical elements = one line
+        found = {u: check(ctx, u, a) for u in a.urls}
         b.close()
     return label, opts.get('has_touch', False), found
 
@@ -299,9 +326,13 @@ def main(argv=None):
     ap.add_argument('--sitemap', type=int, metavar='N', help='with --check: also check N pages from each sitemap of '
                     'the site (products, collections, pages…), spread out; a URL ending in .xml is read as the sitemap itself')
     ap.add_argument('--jobs', type=int, default=4, help='with --check: devices checked at once, one browser each (default 4)')
+    ap.add_argument('--json', metavar='FILE', help='with --check: also write the findings as JSON (a baseline for later runs)')
+    ap.add_argument('--baseline', metavar='FILE', help='with --check: a previous --json; list only problems not in it')
+    ap.add_argument('--html', metavar='FILE', help='with --check: also write a report page with a crop of each problem')
     a = ap.parse_args(argv)
-    if a.sitemap and not a.check:
-        ap.error('--sitemap goes with --check')
+    for flag in ('sitemap', 'json', 'baseline', 'html'):
+        if getattr(a, flag) and not a.check:
+            ap.error(f'--{flag} goes with --check')
     devices = [d for dev in (a.device or ['iPhone 13']) for d in (SAMPLE if dev == 'sample' else [dev])]
     if a.check:
         if a.sitemap:
@@ -314,12 +345,30 @@ def main(argv=None):
                 results = list(ex.map(check_device, [a] * len(devices), devices))
         else:
             results = [check_device(a, dev) for dev in devices]
-        report = {}
+        report, images = {}, {}
         for label, _, found in results:
             for u, problems in found.items():
-                for problem in problems:
+                for problem, img in problems.items():
                     report.setdefault(u, {}).setdefault(problem, []).append(label)
-        return print_report(report, a.urls, [(label, touch) for label, touch, _ in results])
+                    if img:
+                        images.setdefault((u, problem), img)
+        labels = [(label, touch) for label, touch, _ in results]
+        if a.json:  # before --baseline filters it: this run's full picture is the next run's baseline
+            with open(a.json, 'w') as f:
+                json.dump({'devices': [lbl for lbl, _ in labels], 'pages': report}, f, ensure_ascii=False, indent=1)
+        note = ''
+        if a.baseline:
+            with open(a.baseline) as f:
+                old = json.load(f)['pages']
+            gone = sum(1 for u in a.urls for p in old.get(u, {}) if p not in report.get(u, {}))  # fixed, on pages checked now
+            report = {u: {p: s for p, s in ps.items() if p not in old.get(u, {})} for u, ps in report.items()}
+            note = f'Compared with {a.baseline}: only new problems are listed; {gone} gone since.'
+            print(note)
+        common, pages = summarize(report, a.urls, labels)
+        print_report(common, pages, labels)
+        if a.html:
+            write_html(a.html, common, pages, labels, images, note)
+        return len(common) + sum(map(len, pages.values()))
     stem = a.out[:-4] if a.out.endswith('.png') else a.out
     written, shots = [], []
     with sync_playwright() as p:
@@ -355,26 +404,66 @@ def where(seen, labels):
     return ', '.join(seen)
 
 
-def print_report(report, urls, labels):
-    """One block per URL; a problem seen on several devices is listed once, with where it happens. With three
-    pages or more, what every page shares (header, footer, cookie banner) comes first, once."""
-    def block(problems):
-        for problem, seen in sorted(problems.items(), key=lambda kv: -len(kv[1])):
-            print(f'  - {problem}\n      on {where(seen, labels)}')
-
+def summarize(report, urls, labels):
+    """With three pages or more, what every page shares (header, footer, cookie banner) is pulled out once;
+    each page keeps only its own. Returns (common, pages), both {problem: devices}."""
     common = {}
     if len(urls) > 2:
         for problem in set.intersection(*(set(report.get(u, {})) for u in urls)):
             seen = {lbl for u in urls for lbl in report[u][problem]}
             common[problem] = [lbl for lbl, _ in labels if lbl in seen]
-        if common:
-            print(f'On every page ({len(urls)}): {len(common)} problem(s)')
-            block(common)
-    for u in urls:
-        problems = {k: v for k, v in report.get(u, {}).items() if k not in common}
+    return common, {u: {k: v for k, v in report.get(u, {}).items() if k not in common} for u in urls}
+
+
+def by_reach(problems):
+    return sorted(problems.items(), key=lambda kv: -len(kv[1]))  # the ones on most devices first
+
+
+def print_report(common, pages, labels):
+    def block(problems):
+        for problem, seen in by_reach(problems):
+            print(f'  - {problem}\n      on {where(seen, labels)}')
+
+    if common:
+        print(f'On every page ({len(pages)}): {len(common)} problem(s)')
+        block(common)
+    for u, problems in pages.items():
         print(f'{u}: {"OK" if not problems else f"{len(problems)} problem(s)"}{" more" if problems and common else ""}')
         block(problems)
-    return len(common) + sum(len([k for k in v if k not in common]) for v in report.values())
+
+
+HTML_CSS = '''body{font:15px/1.45 system-ui,sans-serif;max-width:980px;margin:32px auto;padding:0 16px;color:#222}
+h1{font-size:22px}h2{font-size:16px;margin:28px 0 8px;word-break:break-all}h2 span{color:#888;font-weight:400}
+ul{list-style:none;padding:0}li{border:1px solid #ddd;border-radius:8px;padding:10px 12px;margin:8px 0}
+small{display:block;color:#777;margin-top:2px}img{display:block;max-width:100%;max-height:320px;margin-top:8px;
+border:1px solid #eee;background:repeating-conic-gradient(#f4f4f4 0 25%,#fff 0 50%) 0/16px 16px}a{color:inherit}'''
+
+
+def write_html(path, common, pages, labels, images, note=''):
+    """The same report as a page to send around: each problem with a crop of the element, from the first device
+    that showed it."""
+    from html import escape
+
+    def items(problems, url=None):
+        rows = []
+        for problem, seen in by_reach(problems):
+            img = images.get((url, problem)) if url else next((images[(u, problem)] for u in pages if (u, problem) in images), None)
+            rows.append(f'<li><b>{escape(problem)}</b><small>on {escape(where(seen, labels))}</small>'
+                        + (f'<img alt="" src="data:image/png;base64,{img}">' if img else '') + '</li>')
+        return '<ul>' + ''.join(rows) + '</ul>'
+
+    total = len(common) + sum(map(len, pages.values()))
+    parts = [f'<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+             f'<title>shot --check: {total} problem(s)</title><style>{HTML_CSS}</style>',
+             f'<h1>{total} problem(s) on {len(pages)} page(s)</h1>',
+             f'<p>{escape(note)} Devices: {escape(", ".join(lbl for lbl, _ in labels))}.</p>']
+    if common:
+        parts.append(f'<h2>On every page <span>({len(pages)})</span></h2>' + items(common))
+    for u, problems in pages.items():
+        parts.append(f'<h2><a href="{escape(u)}">{escape(u)}</a> <span>{len(problems) or "OK"}</span></h2>'
+                     + (items(problems, u) if problems else ''))
+    with open(path, 'w') as f:
+        f.write(''.join(parts))
 
 
 if __name__ == '__main__':

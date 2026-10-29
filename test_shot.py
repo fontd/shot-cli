@@ -73,6 +73,23 @@ with tempfile.TemporaryDirectory() as tmp:
         shot.main([bad.as_uri() + f'?{i}' for i in range(3)] + ['--check', '--wait', '0'])
     text = buf.getvalue()
     assert text.startswith('On every page (3)') and text.count('broken image') == 1 and f'{bad.as_uri()}?2: OK' in text, text
+    # --json + --html (crops), then --baseline: the same run again has nothing new; a problem missing from the
+    # baseline comes back as new
+    import json
+    j, h = pathlib.Path(tmp, 'r.json'), pathlib.Path(tmp, 'r.html')
+    with contextlib.redirect_stdout(io.StringIO()):
+        first = shot.main([bad.as_uri(), good.as_uri(), '--check', '--wait', '0', '--json', str(j), '--html', str(h)])
+        assert shot.main([bad.as_uri(), good.as_uri(), '--check', '--wait', '0', '--baseline', str(j)]) == 0
+    page = h.read_text()
+    assert page.count('<li>') == first and 'data:image/png;base64,' in page and 'tap target 16×16' in page, page[:500]
+    base = json.loads(j.read_text())
+    cut = next(p for p in base['pages'][bad.as_uri()] if p.startswith('broken image'))
+    del base['pages'][bad.as_uri()][cut]
+    j.write_text(json.dumps(base))
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert shot.main([bad.as_uri(), good.as_uri(), '--check', '--wait', '0', '--baseline', str(j)]) == 1
+    assert cut in buf.getvalue() and 'JS error' not in buf.getvalue(), buf.getvalue()
     # --sitemap: products in two chunks (with image entries) count as one kind, the /es/ copy is skipped (it is not
     # even served: fetching it would fail), 2 pages spread through each kind, plus the URL given
     import functools, http.server, threading

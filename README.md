@@ -71,6 +71,26 @@ Devices run in parallel, one browser each (`--jobs`, default 4). A page that fai
 
 A phone zooms out to fit a page that is too wide, so the sideways check compares with the device's width, not `innerWidth`.
 
+### A report to send, and only what is new
+
+```sh
+python3 shot.py URL --check --sitemap 3 -d sample --html report.html --json today.json
+python3 shot.py URL --check --sitemap 3 -d sample --baseline today.json   # later: only problems that are not in today.json
+```
+
+`--html` writes one self-contained page: each problem with a crop of the element, outlined in red, from the first device that showed it. `--json` writes the full findings (`{"devices": [...], "pages": {url: {problem: [devices]}}}`), which is what `--baseline` reads; the exit code then counts only new problems, and the report says how many of the old ones are gone.
+
+## GitHub Action
+
+```yaml
+- uses: fontd/shot-cli@main
+  with:
+    urls: https://shop.example
+    args: --sitemap 2 -d "iPhone SE" -d "iPhone 13" -d desktop
+```
+
+It installs Playwright and Chrome, runs `--check` and uploads `shot-report.html` and `shot-report.json` as the `shot-report` artifact. The step fails when problems are found; add `continue-on-error: true` to keep it as a report only, or pass a committed `--baseline` in `args` to fail only on new ones.
+
 ## Tests
 
 ```sh

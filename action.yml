@@ -1,0 +1,33 @@
+name: shot-cli check
+description: Layout problems of a site as real phones, tablets and desktops render it, as text and an HTML report
+branding:
+  icon: smartphone
+  color: orange
+inputs:
+  urls:
+    description: Space-separated URLs to check
+    required: true
+  args:
+    description: Extra shot.py arguments (devices, --sitemap N, --baseline FILE, --cookie, --hide…)
+    required: false
+    default: ''
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - shell: bash
+      run: |
+        pip install --quiet playwright pillow
+        python -m playwright install --with-deps chrome
+    - shell: bash
+      # the report is uploaded even when problems make this step fail
+      run: python "$GITHUB_ACTION_PATH/shot.py" ${{ inputs.urls }} --check --html shot-report.html --json shot-report.json ${{ inputs.args }}
+    - if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: shot-report
+        path: |
+          shot-report.html
+          shot-report.json
