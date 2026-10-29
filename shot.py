@@ -16,6 +16,7 @@ plus out.png, a contact sheet of them all at CSS-pixel scale, each labelled with
 import argparse
 import os
 import re
+import sys
 from playwright.sync_api import Error as PlaywrightError, sync_playwright
 
 DESKTOPS = {'laptop': (1280, 800), 'desktop': (1440, 900), 'wide': (1920, 1080)}
@@ -133,10 +134,75 @@ def check(ctx, url, a):
             and errors.append(f'console error: {m.text[:160]}'))
     page.on('response', lambda r: r.status >= 400 and not any(n in r.url for n in NOISE)
             and errors.append(f'{r.status} {r.url[:160]}'))
-    load(page, url, a, scroll=True)
-    found = page.evaluate(CHECK_JS, page.viewport_size['width']) + list(dict.fromkeys(errors))
+    try:
+        load(page, url, a, scroll=True)
+        found = page.evaluate(CHECK_JS, page.viewport_size['width'])
+    except PlaywrightError as e:  # a timeout or a crash is a finding for this page, not the end of the run
+        found = [f'did not load: {str(e).splitlines()[0][:160]}']
     page.close()
-    return found
+    return found + list(dict.fromkeys(errors))
+
+
+def launch(p, a):
+    return p.webkit.launch() if a.engine == 'webkit' else p.chromium.launch(channel='chrome')
+
+
+def context(p, b, dev, a):
+    """A throwaway profile as `dev` (presets never touch a real browser), with the run's cookies, hidden
+    selectors and colour scheme. Returns it with its options and its «device · width px» label."""
+    opts = device_opts(p.devices, dev)
+    if a.scheme:
+        opts['color_scheme'] = a.scheme
+    ctx = b.new_context(**opts)
+    hosts = {u.split('/')[2] for u in a.urls if '://' in u and not u.startswith('file:')}
+    ctx.add_cookies([{'name': n, 'value': v, 'domain': h, 'path': '/'}
+                     for c in a.cookie for n, v in [c.split('=', 1)] for h in hosts])
+    if a.hide:  # on every load: a style injected once is lost when a site reloads itself
+        ctx.add_init_script(f'({HIDE_JS})({", ".join(a.hide)!r} + " {{ display: none !important; }}")')
+    return ctx, opts, f'{dev} · {opts["viewport"]["width"]} px'
+
+
+def check_device(a, dev):
+    """Every URL on one device, in a browser of its own, so devices can run in parallel processes."""
+    with sync_playwright() as p:
+        b = launch(p, a)
+        ctx, opts, label = context(p, b, dev, a)
+        found = {u: list(dict.fromkeys(check(ctx, u, a))) for u in a.urls}  # two identical elements = one line
+        b.close()
+    return label, opts.get('has_touch', False), found
+
+
+def sitemap_pages(p, url, n):
+    """The URL plus n pages from each sitemap of its site. Picked evenly through each list, not the first n, so a
+    shop's oldest products don't stand in for all of them."""
+    import xml.etree.ElementTree as ET
+    from urllib.parse import urlsplit
+    req = p.request.new_context()
+
+    def read(sitemap):
+        r = req.get(sitemap, timeout=30000)
+        if not r.ok:
+            raise SystemExit(f'{sitemap}: HTTP {r.status}')
+        root = ET.fromstring(r.body())
+        # direct children only: image sitemaps nest <image:loc> inside <url>
+        return root.tag.endswith('sitemapindex'), [e.text.strip() for e in root.findall('{*}*/{*}loc') if e.text]
+
+    own = url.endswith('.xml')
+    index, found = read(url if own else '{0.scheme}://{0.netloc}/sitemap.xml'.format(urlsplit(url)))
+    groups = {'': found}
+    if index:  # one group per kind: sitemap_products_1…3 are one list; /ca/sitemap_products_1 is the same template
+        groups = {}
+        for s in found:
+            folder, name = urlsplit(s).path.rsplit('/', 1)
+            kind = groups.setdefault(re.sub(r'_\d+$', '', name.removesuffix('.xml')), [folder, []])
+            if kind[0] == folder:
+                kind[1] += read(s)[1]
+        groups = {k: v[1] for k, v in groups.items()}
+    pages = [] if own else [url]
+    for group in groups.values():
+        pages += group[::max(1, len(group) // n)][:n]
+    req.dispose()
+    return pages
 
 
 def capture(ctx, url, a, out):
@@ -219,30 +285,36 @@ def main(argv=None):
     scheme.add_argument('--light', dest='scheme', action='store_const', const='light', help='prefers-color-scheme: light')
     ap.add_argument('--check', action='store_true', help='no images: list layout problems per device for every URL '
                     '(sideways scroll, small tap targets, cut text, broken images, big fixed layers, JS and HTTP errors)')
+    ap.add_argument('--sitemap', type=int, metavar='N', help='with --check: also check N pages from each sitemap of '
+                    'the site (products, collections, pages…), spread out; a URL ending in .xml is read as the sitemap itself')
+    ap.add_argument('--jobs', type=int, default=4, help='with --check: devices checked at once, one browser each (default 4)')
     a = ap.parse_args(argv)
+    if a.sitemap and not a.check:
+        ap.error('--sitemap goes with --check')
     devices = [d for dev in (a.device or ['iPhone 13']) for d in (SAMPLE if dev == 'sample' else [dev])]
+    if a.check:
+        if a.sitemap:
+            with sync_playwright() as p:
+                a.urls = list(dict.fromkeys(pg for u in a.urls for pg in sitemap_pages(p, u, a.sitemap)))
+            print(f'{len(a.urls)} pages × {len(devices)} devices', file=sys.stderr)
+        if min(a.jobs, len(devices)) > 1:
+            from concurrent.futures import ProcessPoolExecutor
+            with ProcessPoolExecutor(min(a.jobs, len(devices))) as ex:
+                results = list(ex.map(check_device, [a] * len(devices), devices))
+        else:
+            results = [check_device(a, dev) for dev in devices]
+        report = {}
+        for label, _, found in results:
+            for u, problems in found.items():
+                for problem in problems:
+                    report.setdefault(u, {}).setdefault(problem, []).append(label)
+        return print_report(report, a.urls, [(label, touch) for label, touch, _ in results])
     stem = a.out[:-4] if a.out.endswith('.png') else a.out
-    written, shots, report, labels = [], [], {}, []
+    written, shots = [], []
     with sync_playwright() as p:
-        b = p.webkit.launch() if a.engine == 'webkit' else p.chromium.launch(channel='chrome')
+        b = launch(p, a)
         for dev in devices:
-            opts = device_opts(p.devices, dev)
-            if a.scheme:
-                opts['color_scheme'] = a.scheme
-            ctx = b.new_context(**opts)  # throwaway profile: presets never touch a real browser
-            hosts = {u.split('/')[2] for u in a.urls if '://' in u and not u.startswith('file:')}
-            ctx.add_cookies([{'name': n, 'value': v, 'domain': h, 'path': '/'}
-                             for c in a.cookie for n, v in [c.split('=', 1)] for h in hosts])
-            if a.hide:  # on every load: a style injected once is lost when a site reloads itself
-                ctx.add_init_script(f'({HIDE_JS})({", ".join(a.hide)!r} + " {{ display: none !important; }}")')
-            label = f'{dev} · {opts["viewport"]["width"]} px'
-            labels.append((label, opts.get('has_touch', False)))
-            if a.check:
-                for u in a.urls:
-                    for problem in dict.fromkeys(check(ctx, u, a)):  # two identical elements = one line
-                        report.setdefault(u, {}).setdefault(problem, []).append(label)
-                ctx.close()
-                continue
+            ctx, opts, label = context(p, b, dev, a)
             out = a.out if len(devices) == 1 else f'{stem}-{re.sub(r"[^a-z0-9]+", "-", dev.lower()).strip("-")}.png'
             if len(a.urls) == 1:
                 capture(ctx, a.urls[0], a, out)
@@ -257,8 +329,6 @@ def main(argv=None):
             written.append(out)
             shots.append((out, label, opts.get('device_scale_factor', 1)))
         b.close()
-    if a.check:
-        return print_report(report, a.urls, labels)
     if len(devices) > 1:
         sheet(shots, f'{stem}.png')
         written.append(f'{stem}.png')

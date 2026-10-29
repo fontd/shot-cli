@@ -59,4 +59,33 @@ with tempfile.TemporaryDirectory() as tmp:
     assert f'{good.as_uri()}: OK' in text, text
     assert '"alone"' not in text, text  # WCAG spacing exception: a small target with room around it passes
     assert n >= 7, n
+    # devices in parallel processes (run as a program: worker processes re-import __main__), a page that does not
+    # load is a finding, exit code 1
+    import subprocess, sys
+    r = subprocess.run([sys.executable, str(pathlib.Path(shot.__file__)), bad.as_uri(), good.as_uri(), 'http://127.0.0.1:9/',
+                        '--check', '-d', 'iPhone 13', '-d', 'desktop', '--wait', '0'], capture_output=True, text=True)
+    assert r.returncode == 1, r
+    assert 'did not load' in r.stdout and f'{good.as_uri()}: OK' in r.stdout, r.stdout
+    assert 'scrolls sideways' in r.stdout and 'on iPhone 13 · 390 px' in r.stdout, r.stdout
+    # --sitemap: products in two chunks (with image entries) count as one kind, the /es/ copy is skipped (it is not
+    # even served: fetching it would fail), 2 pages spread through each kind, plus the URL given
+    import functools, http.server, threading
+    site = pathlib.Path(tmp, 'site')
+    site.mkdir()
+    ns = 'xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:image="http://www.google.com/schemas/sitemap-image/1.1"'
+    (site / 'sitemap.xml').write_text(f'<sitemapindex {ns}>' + ''.join(
+        f'<sitemap><loc>http://127.0.0.1:{{port}}/{s}</loc></sitemap>'
+        for s in ('sitemap_a_1.xml?from=1&amp;to=5', 'sitemap_a_2.xml', 'es/sitemap_a_1.xml', 'sitemap_b_1.xml')) + '</sitemapindex>')
+    for name, first in (('a_1', 0), ('a_2', 5), ('b_1', 0)):
+        (site / f'sitemap_{name}.xml').write_text(f'<urlset {ns}>' + ''.join(
+            f'<url><loc>http://x/{name[0]}{i}</loc><image:image><image:loc>http://x/img{i}.jpg</image:loc></image:image></url>'
+            for i in range(first, first + 5)) + '</urlset>')
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), functools.partial(http.server.SimpleHTTPRequestHandler, directory=site))
+    port = server.server_address[1]
+    (site / 'sitemap.xml').write_text((site / 'sitemap.xml').read_text().replace('{port}', str(port)))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    with sync_playwright() as p:
+        pages = shot.sitemap_pages(p, f'http://127.0.0.1:{port}/', 2)
+    server.shutdown()
+    assert pages == [f'http://127.0.0.1:{port}/', 'http://x/a0', 'http://x/a5', 'http://x/b0', 'http://x/b2'], pages
 print('ok')
