@@ -1,0 +1,22 @@
+name: test
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install playwright pillow && python -m playwright install --with-deps chrome webkit
+      - run: python test_shot.py
+  action:  # the composite action itself, on a page that should be clean
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./
+        with:
+          urls: https://example.com
+          args: -d "iPhone 13" -d desktop
